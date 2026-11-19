@@ -643,4 +643,70 @@ public class EventBridgeV2WriterTest {
     assertThat(event.getId()).isEqualTo("orders-0-1");
     assertThat(entry.systemMetadata().contentType()).isEqualTo("application/json");
   }
+
+  private EventBridgeSinkConfig avroConfig() {
+    return configWith(
+        Map.of(
+            "aws.eventbridge.v2.content.type", "application/avro",
+            "aws.eventbridge.v2.schema.registry.uri",
+                "arn:aws:glue:eu-central-1:123456789012:registry/orders"));
+  }
+
+  private static software.amazon.awssdk.services.eventbridgev2.model.InvalidInputException
+      invalidInput() {
+    return software.amazon.awssdk.services.eventbridgev2.model.InvalidInputException.builder()
+        .message("request too large")
+        .build();
+  }
+
+  /**
+   * Rejects with InvalidInputException any request that contains an offset in {@code rejected};
+   * otherwise publishes every entry.
+   */
+  private void rejectRequestsContaining(java.util.Set<Long> rejected) {
+    when(client.putRawEvents(any(PutRawEventsRequest.class)))
+        .thenAnswer(
+            invocation -> {
+              PutRawEventsRequest request = invocation.getArgument(0);
+              var offsets =
+                  request.entries().stream()
+                      .map(e -> Long.parseLong(e.metadata().get("kafka.offset")))
+                      .toList();
+              if (offsets.stream().anyMatch(rejected::contains)) {
+                return failedWith(invalidInput());
+              }
+              return completedFuture(
+                  PutRawEventsResponse.builder()
+                      .entries(offsets.stream().map(o -> published("evt-" + o)).toList())
+                      .build());
+            });
+  }
+
+  private static List<String> publishedIn(List<PutRawEventsRequest> requests) {
+    return requests.stream()
+        .filter(
+            r -> r.entries().stream().noneMatch(e -> "3".equals(e.metadata().get("kafka.offset"))))
+        .flatMap(r -> r.entries().stream())
+        .map(e -> e.metadata().get("kafka.offset"))
+        .toList();
+  }
+
+  @Test
+  void avroBatchRejectedAsTooLargeIsSplitAndOnlyTheRejectedRecordIsReported() {
+    rejectRequestsContaining(java.util.Set.of(3L));
+    var writer = new EventBridgeV2Writer(client, avroConfig());
+
+    var results = writer.putItems(records(0, 1, 4));
+
+    assertThat(publishedIn(capturedRequests())).containsExactly("1", "2", "4");
+    var rejected = results.stream().filter(EventBridgeResult::isFailure).toList();
+    assertThat(rejected).hasSize(1);
+    assertThat(rejected.get(0).failure().getSinkRecord().kafkaOffset()).isEqualTo(3);
+    assertThat(rejected.get(0).failure().getValue().getType())
+        .isEqualTo(EventBridgeResult.ErrorType.REPORT_ONLY);
+    assertThat(rejected.get(0).failure().getValue().getMessage())
+        .contains("1 MiB")
+        .contains("deserialization")
+        .contains("request too large");
+  }
 }

@@ -15,13 +15,16 @@ import static software.amazon.event.kafkaconnector.EventBridgeResult.success;
 
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
 import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.sink.SinkRecord;
+import org.slf4j.Logger;
 import software.amazon.awssdk.services.eventbridgev2.EventBridgeV2AsyncClient;
 import software.amazon.awssdk.services.eventbridgev2.model.AccessDeniedException;
 import software.amazon.awssdk.services.eventbridgev2.model.InvalidInputException;
@@ -30,7 +33,9 @@ import software.amazon.awssdk.services.eventbridgev2.model.PutRawEventsRequestEn
 import software.amazon.awssdk.services.eventbridgev2.model.PutRawEventsResponse;
 import software.amazon.awssdk.services.eventbridgev2.model.ResourceNotFoundException;
 import software.amazon.awssdk.services.eventbridgev2.model.SuccessCode;
+import software.amazon.event.kafkaconnector.EventBridgeResult.ErrorType;
 import software.amazon.event.kafkaconnector.batch.V2Batching;
+import software.amazon.event.kafkaconnector.logging.ContextAwareLoggerFactory;
 import software.amazon.event.kafkaconnector.mapping.CloudEventsMapper;
 import software.amazon.event.kafkaconnector.mapping.RawPayloadMapper;
 import software.amazon.event.kafkaconnector.mapping.SchemaRegistryConfigurations;
@@ -55,6 +60,16 @@ public class EventBridgeV2Writer implements EventBridgeSinkWriter {
   private final EventBridgeSinkConfig config;
   private final Function<SinkRecord, EventBridgeResult<PutRawEventsRequestEntry>> mapper;
   private final V2Batching batching = new V2Batching();
+  private final Logger log = ContextAwareLoggerFactory.getLogger(EventBridgeV2Writer.class);
+
+  /**
+   * Avro and Protobuf payloads are sized by the service after deserialization, so a request-level
+   * InvalidInputException for them most likely means the request expanded past 1 MiB.
+   */
+  private final boolean splitOnInvalidInput;
+
+  /** Whether any record has been accepted since the task started. */
+  private boolean publishedSinceStart = false;
 
   public EventBridgeV2Writer(EventBridgeV2AsyncClient client, EventBridgeSinkConfig config) {
     this(client, config, new PublishCounters());
@@ -65,6 +80,7 @@ public class EventBridgeV2Writer implements EventBridgeSinkWriter {
     this.client = client;
     this.config = config;
     var assembly = new V2EntryAssembly(config, counters);
+    this.splitOnInvalidInput = SchemaRegistryConfigurations.from(config).isPresent();
     this.mapper =
         "cloudevents".equals(config.v2PayloadStrategy)
             ? new CloudEventsMapper(config, assembly)::map
@@ -89,11 +105,54 @@ public class EventBridgeV2Writer implements EventBridgeSinkWriter {
       }
     }
 
-    var blocked = new HashSet<String>();
+    var call = new CallState();
     for (var batch : batching.apply(mapped)) {
-      results.addAll(sendHoldingBackBlockedGroups(batch, blocked));
+      results.addAll(sendHoldingBackBlockedGroups(batch, call));
     }
-    return results;
+    if (results.stream().anyMatch(EventBridgeResult::isSuccess)) {
+      publishedSinceStart = true;
+    }
+    return call.sizeRejections.isEmpty() ? results : resolveSizeRejections(results, call);
+  }
+
+  /** State shared by the requests of one {@link #putItems} call. */
+  private static final class CallState {
+    final Set<String> blocked = new HashSet<>();
+    final Map<SinkRecord, Throwable> sizeRejections = new IdentityHashMap<>();
+  }
+
+  /**
+   * A single record rejected with InvalidInputException is reported if the task has published
+   * anything, since the request was then most likely too large after deserialization; otherwise the
+   * cause is more likely configuration and the task fails.
+   */
+  private List<EventBridgeResult<String>> resolveSizeRejections(
+      List<EventBridgeResult<String>> results, CallState call) {
+    return results.stream()
+        .map(
+            result -> {
+              var cause =
+                  result.isFailure()
+                      ? call.sizeRejections.get(result.failure().getSinkRecord())
+                      : null;
+              if (cause == null) {
+                return result;
+              }
+              var record = result.failure().getSinkRecord();
+              return publishedSinceStart
+                  ? EventBridgeResult.<String>failure(
+                      record, reportOnly(expandedOversizeMessage(cause), cause))
+                  : EventBridgeResult.<String>failure(record, panic(cause));
+            })
+        .toList();
+  }
+
+  private static String expandedOversizeMessage(Throwable cause) {
+    return String.format(
+        "Request rejected with InvalidInputException; the entry is most likely larger than the 1 MiB"
+            + " PutRawEvents request limit after Avro/Protobuf deserialization, which EventBridge"
+            + " counts as expanded JSON: %s",
+        cause.getMessage());
   }
 
   /**
@@ -103,7 +162,8 @@ public class EventBridgeV2Writer implements EventBridgeSinkWriter {
    * call. Results are in batch order.
    */
   private List<EventBridgeResult<String>> sendHoldingBackBlockedGroups(
-      List<MappedSinkRecord<PutRawEventsRequestEntry>> batch, Set<String> blocked) {
+      List<MappedSinkRecord<PutRawEventsRequestEntry>> batch, CallState call) {
+    var blocked = call.blocked;
     var held = new boolean[batch.size()];
     var toSend = new ArrayList<MappedSinkRecord<PutRawEventsRequestEntry>>();
     for (int i = 0; i < batch.size(); i++) {
@@ -113,7 +173,22 @@ public class EventBridgeV2Writer implements EventBridgeSinkWriter {
         toSend.add(batch.get(i));
       }
     }
-    var sent = (toSend.isEmpty() ? List.<EventBridgeResult<String>>of() : send(toSend)).iterator();
+    var sentResults = toSend.isEmpty() ? List.<EventBridgeResult<String>>of() : send(toSend);
+    var sizeRejection = splitOnInvalidInput ? invalidInputCause(sentResults) : null;
+    if (sizeRejection != null && toSend.size() > 1) {
+      log.warn(
+          "PutRawEvents request of {} entries rejected with InvalidInputException; splitting it, as"
+              + " it is most likely larger than 1 MiB after deserialization",
+          toSend.size());
+      var middle = batch.size() / 2;
+      var results = new ArrayList<>(sendHoldingBackBlockedGroups(batch.subList(0, middle), call));
+      results.addAll(sendHoldingBackBlockedGroups(batch.subList(middle, batch.size()), call));
+      return results;
+    }
+    if (sizeRejection != null) {
+      call.sizeRejections.put(toSend.get(0).getSinkRecord(), sizeRejection);
+    }
+    var sent = sentResults.iterator();
 
     var results = new ArrayList<EventBridgeResult<String>>();
     for (int i = 0; i < batch.size(); i++) {
@@ -145,6 +220,19 @@ public class EventBridgeV2Writer implements EventBridgeSinkWriter {
   private static String groupOf(MappedSinkRecord<PutRawEventsRequestEntry> item) {
     var systemMetadata = item.getValue().systemMetadata();
     return systemMetadata == null ? null : systemMetadata.eventGroupId();
+  }
+
+  /** The InvalidInputException behind a whole-request panic, or null. */
+  private static Throwable invalidInputCause(List<EventBridgeResult<String>> results) {
+    if (results.isEmpty()) {
+      return null;
+    }
+    var first = results.get(0);
+    if (first.isSuccess() || first.failure().getValue().getType() != ErrorType.PANIC) {
+      return null;
+    }
+    var cause = first.failure().getValue().getCause();
+    return cause instanceof InvalidInputException ? cause : null;
   }
 
   private List<EventBridgeResult<String>> send(
