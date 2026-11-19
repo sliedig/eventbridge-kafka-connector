@@ -709,4 +709,87 @@ public class EventBridgeV2WriterTest {
         .contains("deserialization")
         .contains("request too large");
   }
+
+  @Test
+  void avroRejectionBeforeAnyPublishFailsTheTask() {
+    when(client.putRawEvents(any(PutRawEventsRequest.class)))
+        .thenReturn(failedWith(invalidInput()));
+    var writer = new EventBridgeV2Writer(client, avroConfig());
+
+    var results = writer.putItems(records(0, 1, 4));
+
+    assertThat(results).noneMatch(EventBridgeResult::isSuccess);
+    assertThat(results)
+        .anyMatch(r -> r.failure().getValue().getType() == EventBridgeResult.ErrorType.PANIC);
+    assertThat(results)
+        .noneMatch(
+            r -> r.failure().getValue().getType() == EventBridgeResult.ErrorType.REPORT_ONLY);
+  }
+
+  @Test
+  void avroSingleRejectionAfterAnEarlierPublishIsReported() {
+    rejectRequestsContaining(java.util.Set.of(3L));
+    var writer = new EventBridgeV2Writer(client, avroConfig());
+    writer.putItems(records(0, 1, 1));
+
+    var results = writer.putItems(records(0, 3, 1));
+
+    assertThat(results.get(0).failure().getValue().getType())
+        .isEqualTo(EventBridgeResult.ErrorType.REPORT_ONLY);
+  }
+
+  @Test
+  void splitHalvesKeepGroupHoldBack() {
+    // the full batch is rejected; in the first half, offset 0 is throttled per entry
+    when(client.putRawEvents(any(PutRawEventsRequest.class)))
+        .thenAnswer(
+            invocation -> {
+              PutRawEventsRequest request = invocation.getArgument(0);
+              var offsets =
+                  request.entries().stream()
+                      .map(e -> Long.parseLong(e.metadata().get("kafka.offset")))
+                      .toList();
+              if (offsets.contains(3L)) {
+                return failedWith(invalidInput());
+              }
+              return completedFuture(
+                  PutRawEventsResponse.builder()
+                      .entries(
+                          offsets.stream()
+                              .map(o -> o == 0 ? failed("ThrottlingException") : published("evt"))
+                              .toList())
+                      .build());
+            });
+    var writer = new EventBridgeV2Writer(client, avroConfig());
+
+    var results = writer.putItems(records(0, 0, 4));
+
+    assertThat(capturedRequests())
+        .extracting(r -> sent(List.of(r)))
+        .containsExactly(range(0, 0, 4), range(0, 0, 2));
+    assertThat(retried(results)).containsExactly("0:0", "0:2", "0:3");
+    assertThat(results)
+        .extracting(EventBridgeV2WriterTest::offsetOf)
+        .containsExactly(0L, 1L, 2L, 3L);
+  }
+
+  static java.util.stream.Stream<Map<String, Object>> nonDeserializedConfigs() {
+    return java.util.stream.Stream.of(
+        Map.of("aws.eventbridge.v2.content.type", "application/json"),
+        Map.of("aws.eventbridge.v2.payload.strategy", "cloudevents"));
+  }
+
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.MethodSource("nonDeserializedConfigs")
+  void nonDeserializedPayloadsStillPanicWithoutSplitting(Map<String, Object> extra) {
+    when(client.putRawEvents(any(PutRawEventsRequest.class)))
+        .thenReturn(failedWith(invalidInput()));
+    var writer = new EventBridgeV2Writer(client, configWith(extra));
+
+    var results = writer.putItems(records(0, 1, 4));
+
+    verify(client, times(1)).putRawEvents(any(PutRawEventsRequest.class));
+    assertThat(results)
+        .allMatch(r -> r.failure().getValue().getType() == EventBridgeResult.ErrorType.PANIC);
+  }
 }
