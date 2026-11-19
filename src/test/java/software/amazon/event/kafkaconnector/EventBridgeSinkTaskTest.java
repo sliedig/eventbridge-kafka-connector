@@ -393,6 +393,54 @@ public class EventBridgeSinkTaskTest {
         .containsExactly("1");
   }
 
+  private static EventBridgeSinkConfig v2AvroConfig() {
+    return new EventBridgeSinkConfig(
+        Map.of(
+            "aws.eventbridge.retries.max", 2,
+            "aws.eventbridge.retries.delay", 0,
+            "aws.eventbridge.connector.id", "someId",
+            "aws.eventbridge.region", "eu-central-1",
+            "aws.eventbridge.eventbus.arn",
+                "arn:aws:events:eu-central-1:123456789012:event-busv2/my-bus/ABCDEFGHIJKLM1234567890",
+            "aws.eventbridge.api.version", "v2",
+            "aws.eventbridge.v2.payload.strategy", "raw",
+            "aws.eventbridge.v2.content.type", "application/avro",
+            "aws.eventbridge.v2.schema.registry.uri",
+                "arn:aws:glue:eu-central-1:123456789012:registry/orders"));
+  }
+
+  @Test
+  @DisplayName("v2: an Avro record too large after deserialization goes to the DLQ")
+  public void v2AvroRecordTooLargeAfterDeserializationGoesToDlq() {
+    var v2Client = org.mockito.Mockito.mock(EventBridgeV2AsyncClient.class);
+    when(v2Client.putRawEvents(any(PutRawEventsRequest.class)))
+        .thenAnswer(
+            invocation -> {
+              PutRawEventsRequest request = invocation.getArgument(0);
+              if (offsetsOf(request).contains("3")) {
+                return java.util.concurrent.CompletableFuture.failedFuture(
+                    software.amazon.awssdk.services.eventbridgev2.model.InvalidInputException
+                        .builder()
+                        .message("request too large")
+                        .build());
+              }
+              return completedFuture(
+                  PutRawEventsResponse.builder()
+                      .entries(request.entries().stream().map(e -> v2Published()).toList())
+                      .build());
+            });
+    var config = v2AvroConfig();
+    var task = new EventBridgeSinkTask();
+    task.startInternal(config, new EventBridgeV2Writer(v2Client, config), dlq);
+    var tooLarge = v2Record("c", 3);
+
+    task.put(List.of(v2Record("a", 1), v2Record("b", 2), tooLarge, v2Record("d", 4)));
+
+    verify(dlq).report(org.mockito.ArgumentMatchers.eq(tooLarge), any(Throwable.class));
+    assertThat(task.counters().published()).isEqualTo(3);
+    assertThat(task.counters().dlq()).isEqualTo(1);
+  }
+
   private static EventBridgeSinkConfig v2Config() {
     return new EventBridgeSinkConfig(
         Map.of(
