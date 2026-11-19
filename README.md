@@ -201,7 +201,9 @@ support `aws.eventbridge.offloading.default.*`, `aws.eventbridge.eventbus.global
   queue if one is configured. Unlike v1, v2 mode has no S3 offloading for large payloads. For Avro and Protobuf
   payloads that EventBridge deserializes through a schema registry, the service counts the expanded JSON rather than
   the bytes the connector sends, so an entry or request that passes the connector's check can still be rejected by
-  the service. Leave headroom for that expansion when sizing Avro or Protobuf records.
+  the service. If the service rejects a request of Avro or Protobuf entries this way, the connector splits it until
+  the rejected record is alone, publishes the rest in order, and sends that record to the dead-letter queue (see
+  [Retry Behavior](#retry-behavior)). Leave headroom for that expansion when sizing Avro or Protobuf records.
 - **Identifier length**: EventBridge accepts `EventGroupId` and `DeduplicationId` values of 1 to 128 characters. A
   value of 128 characters or fewer is sent unchanged. A longer value, for example from a long topic name or record
   key, is replaced by its first 63 characters, a `-`, and the lowercase hex SHA-256 of the full value (UTF-8), which
@@ -731,7 +733,8 @@ follows:
 | Per-entry `ThrottlingException` (event group over its quota), `InternalError`, or `Throttling` (the service is shedding load) inside a successful response | Only that record is retried, under `aws.eventbridge.retries.max` and `aws.eventbridge.retries.delay`. The other entries in the request are published once. If the retries run out, the task fails. |
 | Any other per-entry error (e.g. `VALIDATION_ERROR` when a payload does not match its schema, or a code the connector does not recognize) | Only that record fails, without a retry; it is sent to the dead-letter queue if configured, and the other entries in the request are published. |
 | `ThrottlingException`, `SchemaRegistryUnavailableException`, `InternalException`, timeouts | All records in the request are retried. |
-| `InvalidInputException`, `AccessDeniedException`, `ResourceNotFoundException` | Not retried; the task fails, since these indicate a configuration or permission problem. |
+| `InvalidInputException`, `AccessDeniedException`, `ResourceNotFoundException` | Not retried; the task fails, since these indicate a configuration or permission problem. Exception: with the `raw` strategy and content type `application/avro` or `application/protobuf`, see the next row. |
+| `InvalidInputException` for Avro or Protobuf entries | EventBridge counts these entries after deserialization, so this most likely means the request expanded past 1 MiB. The connector splits the request in halves, sent in order, until the rejected record is alone, and sends that record to the dead-letter queue. If the task has not published any record since it started, the task fails instead, since the cause is then more likely configuration. |
 | Entry larger than 1 MiB | Never sent; fails without a retry and goes to the dead-letter queue if configured. |
 | Per-entry `DEDUPLICATED` result | Treated as a successful publish. |
 
@@ -741,6 +744,13 @@ follows:
 > per-entry `ThrottlingException`. With the default retry settings (2 retries, 200 ms apart), a group that stays over
 > the limit for more than about half a second fails the task instead of dropping records. For hot topics in v2 mode,
 > raise `aws.eventbridge.retries.max` and `aws.eventbridge.retries.delay`, and spread the topic over more partitions.
+
+> [!NOTE]
+> A new Avro or Protobuf connector whose first flush contains only records that EventBridge rejects after
+> deserialization fails with `InvalidInputException` until something publishes. If the configuration is correct, skip
+> the oversize record by moving the connector's consumer group offset past it, e.g. with
+> `kafka-consumer-groups --reset-offsets --to-offset <offset+1> --group connect-<connector-name> --topic <topic>:<partition>`
+> while the connector is stopped.
 
 ### Authentication and Permissions
 
